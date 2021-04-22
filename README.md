@@ -29,8 +29,6 @@ To install from repo,
 - Press play -- Nothing will seem to happen other than the pause button lighting 
 - In Nuke, click on the relevant UI components to start debugging them
 
-The Nuke UI Adapter should now be functional just by pressing play.
-
 If it is your first time installing the adapter and Nuke is already open, make sure to restart Nuke first (a first-time setup is performed).
 
 ## Note
