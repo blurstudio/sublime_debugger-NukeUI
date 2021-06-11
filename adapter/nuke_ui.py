@@ -3,7 +3,8 @@ from Debugger.modules.typecheck import *
 import Debugger.modules.debugger.adapter as adapter
 
 from os.path import join, abspath, dirname, expanduser, exists
-from shutil import copy
+from shutil import copy, which
+import socket
 
 from .util import debugpy_path, ATTACH_TEMPLATE, log as custom_log
 
