@@ -88,11 +88,15 @@ class NukeUI(adapter.AdapterConfiguration):
 		to other parts of the device to prepare for debugging in the future
 		"""
 		
-		package_path = dirname(abspath(__file__))
-		adapter_path = join(package_path, "adapter")
+		adapter_path = dirname(abspath(__file__))
 
 		# Add debugpy injector to nuke if not present
 		user_nuke_path = join(expanduser("~"), ".nuke")
+
+		# Check if nuke folder exists
+		if not exists(user_nuke_path):
+			raise Exception(f"Your nuke settings folder could not be found (at {user_nuke_path}). Please make sure you've run Nuke at least once and try again.")
+
 		src_srv = join(adapter_path, 'resources', 'ui_debug_server.py')
 
 		dst_srv = join(user_nuke_path, "ui_debug_server.py")
