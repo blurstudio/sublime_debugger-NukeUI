@@ -76,6 +76,10 @@ class NukeUI(adapter.AdapterConfiguration):
 
 		custom_log(f"Sent attach code:\n\n {attach_code}")
 
+		# Wait for code to be processed in Nuke
+		import time
+		time.sleep(5)
+
 		custom_log(f"Connecting to {host}:{str(port)}")
 		
 		return adapter.SocketTransport(log, host, port)
