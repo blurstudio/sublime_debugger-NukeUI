@@ -44,9 +44,9 @@ class NukeUI(adapter.AdapterConfiguration):
 		python = configuration.get("pythonPath")
 
 		if not python:
-			if which("python3"):
-				python = "python3"
-			elif not (python := which("python")):
+			if (python := which("python")):
+				pass
+			elif not (python := which("python3")):
 				raise Exception('No python installation found')
 		
 		custom_log(f"Found python install: {python}")
@@ -78,7 +78,7 @@ class NukeUI(adapter.AdapterConfiguration):
 
 		# Wait for code to be processed in Nuke
 		import time
-		time.sleep(5)
+		time.sleep(2)
 
 		custom_log(f"Connecting to {host}:{str(port)}")
 		
@@ -108,17 +108,17 @@ class NukeUI(adapter.AdapterConfiguration):
 
 		first_setup = False
 
-		if not exists(dst_srv):
-			copy(src_srv, dst_srv)
-			first_setup = True
+		copy(src_srv, dst_srv)
 
 		if not exists(menu):
+			first_setup = True
 			with open(menu, 'w') as f:
 				f.write('import ui_debug_server')
 		else:
 			with open(menu, 'r+') as f:
 				contents = f.read()
 				if "import ui_debug_server" not in contents:
+					first_setup = True
 					f.write("\nimport ui_debug_server")
 
 		if first_setup:
@@ -131,7 +131,7 @@ class NukeUI(adapter.AdapterConfiguration):
 	@property
 	def installed_version(self) -> Optional[str]:
 		# The version is only used for display in the UI
-		return '0.0.1'
+		return '0.0.2'
 
 	@property
 	def configuration_snippets(self) -> Optional[list]:

@@ -34,7 +34,6 @@ cdef class PyDBAdditionalThreadInfo:
 #         'pydev_original_step_cmd',
 #         'pydev_step_cmd',
 #         'pydev_notify_kill',
-#         'pydev_smart_step_stop',
 #         'pydev_django_resolve_frame',
 #         'pydev_call_from_jinja2',
 #         'pydev_call_inside_jinja2',
@@ -50,6 +49,16 @@ cdef class PyDBAdditionalThreadInfo:
 #         'top_level_thread_tracer_unhandled',
 #         'thread_tracer',
 #         'step_in_initial_location',
+# 
+#         # Used for CMD_SMART_STEP_INTO (to know which smart step into variant to use)
+#         'pydev_smart_parent_offset',
+#         'pydev_smart_child_offset',
+# 
+#         # Used for CMD_SMART_STEP_INTO (list[_pydevd_bundle.pydevd_bytecode_utils.Variant])
+#         # Filled when the cmd_get_smart_step_into_variants is requested (so, this is a copy
+#         # of the last request for a given thread and pydev_smart_parent_offset/pydev_smart_child_offset relies on it).
+#         'pydev_smart_step_into_variants',
+#         'target_id_to_smart_step_into_variant',
 #     ]
     # ENDIF
 
@@ -67,7 +76,6 @@ cdef class PyDBAdditionalThreadInfo:
         self.pydev_step_cmd = -1  # Something as CMD_STEP_INTO, CMD_STEP_OVER, etc.
 
         self.pydev_notify_kill = False
-        self.pydev_smart_step_stop = None
         self.pydev_django_resolve_frame = False
         self.pydev_call_from_jinja2 = None
         self.pydev_call_inside_jinja2 = None
@@ -83,6 +91,10 @@ cdef class PyDBAdditionalThreadInfo:
         self.top_level_thread_tracer_unhandled = None
         self.thread_tracer = None
         self.step_in_initial_location = None
+        self.pydev_smart_parent_offset = -1
+        self.pydev_smart_child_offset = -1
+        self.pydev_smart_step_into_variants = ()
+        self.target_id_to_smart_step_into_variant = {}
 
     def get_topmost_frame(self, thread):
         '''
@@ -143,6 +155,12 @@ from _pydevd_bundle.pydevd_frame_utils import add_exception_to_frame, just_raise
 from _pydevd_bundle.pydevd_utils import get_clsname_for_code
 from pydevd_file_utils import get_abs_path_real_path_and_base_from_frame
 from _pydevd_bundle.pydevd_comm_constants import constant_to_str
+try:
+    from _pydevd_bundle.pydevd_bytecode_utils import get_smart_step_into_variant_from_frame_offset
+except ImportError:
+
+    def get_smart_step_into_variant_from_frame_offset(*args, **kwargs):
+        return None
 
 # IFDEF CYTHON -- DONT EDIT THIS FILE (it is automatically generated)
 # ELSE
@@ -169,6 +187,11 @@ DEBUG_START_PY3K = ('_pydev_execfile.py', 'execfile')
 TRACE_PROPERTY = 'pydevd_traceproperty.py'
 
 import dis
+
+try:
+    StopAsyncIteration
+except NameError:
+    StopAsyncIteration = StopIteration
 
 
 # IFDEF CYTHON -- DONT EDIT THIS FILE (it is automatically generated)
@@ -338,7 +361,7 @@ cdef class PyDBFrame:
                     if exception == SystemExit and main_debugger.ignore_system_exit_code(value):
                         pass
 
-                    elif exception in (GeneratorExit, StopIteration):
+                    elif exception in (GeneratorExit, StopIteration, StopAsyncIteration):
                         # These exceptions are control-flow related (they work as a generator
                         # pause), so, we shouldn't stop on them.
                         pass
@@ -641,6 +664,7 @@ cdef class PyDBFrame:
         cdef bint is_exception_event;
         cdef bint has_exception_breakpoints;
         cdef bint can_skip;
+        cdef bint stop;
         cdef PyDBAdditionalThreadInfo info;
         cdef int step_cmd;
         cdef int line;
@@ -649,6 +673,7 @@ cdef class PyDBFrame:
         cdef bint is_return;
         cdef bint should_stop;
         cdef dict breakpoints_for_file;
+        cdef dict stop_info;
         cdef str curr_func_name;
         cdef bint exist_result;
         cdef dict frame_skips_cache;
@@ -660,6 +685,9 @@ cdef class PyDBFrame:
         cdef bint is_coroutine_or_generator;
         cdef int bp_line;
         cdef object bp;
+        cdef int pydev_smart_parent_offset
+        cdef int pydev_smart_child_offset
+        cdef tuple pydev_smart_step_into_variants
     # ELSE
 #     def trace_dispatch(self, frame, event, arg):
     # ENDIF
@@ -796,8 +824,8 @@ cdef class PyDBFrame:
                     # to make a step in or step over at that location).
                     # Note: this is especially troublesome when we're skipping code with the
                     # @DontTrace comment.
-                    if stop_frame is frame and is_return and step_cmd in (108, 109, 159, 160):
-                        if step_cmd in (108, 109):
+                    if stop_frame is frame and is_return and step_cmd in (108, 109, 159, 160, 128):
+                        if step_cmd in (108, 109, 128):
                             info.pydev_step_cmd = 107
                         else:
                             info.pydev_step_cmd = 144
@@ -843,6 +871,13 @@ cdef class PyDBFrame:
                         can_skip = True
 
                     elif step_cmd in (108, 109, 159, 160) and stop_frame is not frame:
+                        can_skip = True
+
+                    elif step_cmd == 128 and (
+                            stop_frame is not None and
+                            stop_frame is not frame and
+                            stop_frame is not frame.f_back and
+                            (frame.f_back is None or stop_frame is not frame.f_back.f_back)):
                         can_skip = True
 
                     elif step_cmd == 144:
@@ -994,7 +1029,7 @@ cdef class PyDBFrame:
 
                 if main_debugger.show_return_values:
                     if is_return and (
-                            (info.pydev_step_cmd in (108, 159) and (frame.f_back is stop_frame)) or
+                            (info.pydev_step_cmd in (108, 159, 128) and (frame.f_back is stop_frame)) or
                             (info.pydev_step_cmd in (109, 160) and (frame is stop_frame)) or
                             (info.pydev_step_cmd in (107, 206)) or
                             (
@@ -1111,19 +1146,74 @@ cdef class PyDBFrame:
 
                 elif step_cmd == 128:
                     stop = False
-                    if info.pydev_smart_step_stop is frame:
-                        info.pydev_func_name = '.invalid.'  # Must match the type in cython
-                        info.pydev_smart_step_stop = None
+                    back = frame.f_back
+                    if stop_frame is frame and is_return:
+                        # We're exiting the smart step into initial frame (so, we probably didn't find our target).
+                        stop = True
 
-                    if is_line or is_exception_event:
-                        curr_func_name = frame.f_code.co_name
+                    elif stop_frame is back and is_line:
+                        if info.pydev_smart_child_offset != -1:
+                            # i.e.: in this case, we're not interested in the pause in the parent, rather
+                            # we're interested in the pause in the child (when the parent is at the proper place).
+                            stop = False
 
-                        # global context is set with an empty name
-                        if curr_func_name in ('?', '<module>') or curr_func_name is None:
-                            curr_func_name = ''
+                        else:
+                            pydev_smart_parent_offset = info.pydev_smart_parent_offset
 
-                        if curr_func_name == info.pydev_func_name:
-                            stop = True
+                            pydev_smart_step_into_variants = info.pydev_smart_step_into_variants
+                            if pydev_smart_parent_offset >= 0 and pydev_smart_step_into_variants:
+                                # Preferred mode (when the smart step into variants are available
+                                # and the offset is set).
+                                stop = get_smart_step_into_variant_from_frame_offset(back.f_lasti, pydev_smart_step_into_variants) is \
+                                       get_smart_step_into_variant_from_frame_offset(pydev_smart_parent_offset, pydev_smart_step_into_variants)
+
+                            else:
+                                # Only the name/line is available, so, check that.
+                                curr_func_name = frame.f_code.co_name
+
+                                # global context is set with an empty name
+                                if curr_func_name in ('?', '<module>') or curr_func_name is None:
+                                    curr_func_name = ''
+                                if curr_func_name == info.pydev_func_name and stop_frame.f_lineno == info.pydev_next_line:
+                                    stop = True
+
+                        if not stop:
+                            # In smart step into, if we didn't hit it in this frame once, that'll
+                            # not be the case next time either, so, disable tracing for this frame.
+                            return None if is_call else NO_FTRACE
+
+                    elif back is not None and stop_frame is back.f_back and is_line:
+                        # Ok, we have to track 2 stops at this point, the parent and the child offset.
+                        # This happens when handling a step into which targets a function inside a list comprehension
+                        # or generator (in which case an intermediary frame is created due to an internal function call).
+                        pydev_smart_parent_offset = info.pydev_smart_parent_offset
+                        pydev_smart_child_offset = info.pydev_smart_child_offset
+                        # print('matched back frame', pydev_smart_parent_offset, pydev_smart_child_offset)
+                        # print('parent f_lasti', back.f_back.f_lasti)
+                        # print('child f_lasti', back.f_lasti)
+                        stop = False
+                        if pydev_smart_child_offset >= 0 and pydev_smart_child_offset >= 0:
+                            pydev_smart_step_into_variants = info.pydev_smart_step_into_variants
+
+                            if pydev_smart_parent_offset >= 0 and pydev_smart_step_into_variants:
+                                # Note that we don't really check the parent offset, only the offset of
+                                # the child (because this is a generator, the parent may have moved forward
+                                # already -- and that's ok, so, we just check that the parent frame
+                                # matches in this case).
+                                smart_step_into_variant = get_smart_step_into_variant_from_frame_offset(pydev_smart_parent_offset, pydev_smart_step_into_variants)
+                                # print('matched parent offset', pydev_smart_parent_offset)
+                                # Ok, now, check the child variant
+                                children_variants = smart_step_into_variant.children_variants
+                                stop = children_variants and (
+                                    get_smart_step_into_variant_from_frame_offset(back.f_lasti, children_variants) is \
+                                    get_smart_step_into_variant_from_frame_offset(pydev_smart_child_offset, children_variants)
+                                )
+                                # print('stop at child', stop)
+
+                        if not stop:
+                            # In smart step into, if we didn't hit it in this frame once, that'll
+                            # not be the case next time either, so, disable tracing for this frame.
+                            return None if is_call else NO_FTRACE
 
                 elif step_cmd in (109, 160):
                     stop = is_return and stop_frame is frame
@@ -1191,10 +1281,10 @@ cdef class PyDBFrame:
                     return None if is_call else NO_FTRACE
 
             # if we are quitting, let's stop the tracing
-            if not main_debugger.quitting:
-                return self.trace_dispatch
-            else:
+            if main_debugger.quitting:
                 return None if is_call else NO_FTRACE
+
+            return self.trace_dispatch
         finally:
             info.is_tracing -= 1
 

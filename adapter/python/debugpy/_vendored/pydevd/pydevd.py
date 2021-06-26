@@ -17,7 +17,13 @@ import traceback
 import weakref
 import getpass as getpass_mod
 import functools
-import pydevd_file_utils
+try:
+    import pydevd_file_utils
+except ImportError:
+    # On the first import of a pydevd module, add pydevd itself to the PYTHONPATH
+    # if its dependencies cannot be imported.
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    import pydevd_file_utils
 
 from _pydev_bundle import pydev_imports, pydev_log
 from _pydev_bundle._pydev_filesystem_encoding import getfilesystemencoding
@@ -27,7 +33,7 @@ from _pydev_imps._pydev_saved_modules import thread
 from _pydev_imps._pydev_saved_modules import threading
 from _pydev_imps._pydev_saved_modules import time
 from _pydevd_bundle import pydevd_extension_utils, pydevd_frame_utils, pydevd_constants
-from _pydevd_bundle.pydevd_filtering import FilesFiltering
+from _pydevd_bundle.pydevd_filtering import FilesFiltering, glob_matches_path
 from _pydevd_bundle import pydevd_io, pydevd_vm_type
 from _pydevd_bundle import pydevd_utils
 from _pydev_bundle.pydev_console_utils import DebugConsoleStdIn
@@ -62,7 +68,7 @@ from pydevd_file_utils import get_fullname, get_package_dir
 from os.path import abspath as os_path_abspath
 import pydevd_tracing
 from _pydevd_bundle.pydevd_comm import (InternalThreadCommand, InternalThreadCommandForAnyThread,
-    create_server_socket)
+    create_server_socket, FSNotifyThread)
 from _pydevd_bundle.pydevd_comm import(InternalConsoleExec,
     _queue, ReaderThread, GetGlobalDebugger, get_global_debugger,
     set_global_debugger, WriterThread,
@@ -84,7 +90,7 @@ from _pydevd_bundle.pydevd_thread_lifecycle import suspend_all_threads, mark_thr
 if USE_CUSTOM_SYS_CURRENT_FRAMES_MAP:
     from _pydevd_bundle.pydevd_constants import constructed_tid_to_last_frame
 
-__version_info__ = (2, 1, 0)
+__version_info__ = (2, 4, 1)
 __version_info_str__ = []
 for v in __version_info__:
     __version_info_str__.append(str(v))
@@ -490,6 +496,7 @@ class PyDB(object):
 
         self.reader = None
         self.writer = None
+        self._fsnotify_thread = None
         self.created_pydb_daemon_threads = {}
         self._waiting_for_connection_thread = None
         self._on_configuration_done_event = threading.Event()
@@ -537,6 +544,7 @@ class PyDB(object):
         self.ready_to_run = False
         self._main_lock = thread.allocate_lock()
         self._lock_running_thread_ids = thread.allocate_lock()
+        self._lock_create_fs_notify = thread.allocate_lock()
         self._py_db_command_thread_event = threading.Event()
         if set_as_global:
             CustomFramesContainer._py_db_command_thread_event = self._py_db_command_thread_event
@@ -585,6 +593,7 @@ class PyDB(object):
         self.asyncio_analyser = None
 
         # matplotlib support in debugger and debug console
+        self._installed_mpl_support = False
         self.mpl_in_use = False
         self.mpl_hooks_in_debug_console = False
         self.mpl_modules_for_patching = {}
@@ -665,6 +674,77 @@ class PyDB(object):
 
         # Stop the tracing as the last thing before the actual shutdown for a clean exit.
         atexit.register(stoptrace)
+
+    def setup_auto_reload_watcher(self, enable_auto_reload, watch_dirs, poll_target_time, exclude_patterns, include_patterns):
+        try:
+            with self._lock_create_fs_notify:
+
+                # When setting up, dispose of the previous one (if any).
+                if self._fsnotify_thread is not None:
+                    self._fsnotify_thread.do_kill_pydev_thread()
+                    self._fsnotify_thread = None
+
+                if not enable_auto_reload:
+                    return
+
+                exclude_patterns = tuple(exclude_patterns)
+                include_patterns = tuple(include_patterns)
+
+                def accept_directory(absolute_filename, cache={}):
+                    try:
+                        return cache[absolute_filename]
+                    except:
+                        if absolute_filename and absolute_filename[-1] not in ('/', '\\'):
+                            # I.e.: for directories we always end with '/' or '\\' so that
+                            # we match exclusions such as "**/node_modules/**"
+                            absolute_filename += os.path.sep
+
+                        # First include what we want
+                        for include_pattern in include_patterns:
+                            if glob_matches_path(absolute_filename, include_pattern):
+                                cache[absolute_filename] = True
+                                return True
+
+                        # Then exclude what we don't want
+                        for exclude_pattern in exclude_patterns:
+                            if glob_matches_path(absolute_filename, exclude_pattern):
+                                cache[absolute_filename] = False
+                                return False
+
+                        # By default track all directories not excluded.
+                        cache[absolute_filename] = True
+                        return True
+
+                def accept_file(absolute_filename, cache={}):
+                    try:
+                        return cache[absolute_filename]
+                    except:
+                        # First include what we want
+                        for include_pattern in include_patterns:
+                            if glob_matches_path(absolute_filename, include_pattern):
+                                cache[absolute_filename] = True
+                                return True
+
+                        # Then exclude what we don't want
+                        for exclude_pattern in exclude_patterns:
+                            if glob_matches_path(absolute_filename, exclude_pattern):
+                                cache[absolute_filename] = False
+                                return False
+
+                        # By default don't track files not included.
+                        cache[absolute_filename] = False
+                        return False
+
+                self._fsnotify_thread = FSNotifyThread(self, PyDevdAPI(), watch_dirs)
+                watcher = self._fsnotify_thread.watcher
+                watcher.accept_directory = accept_directory
+                watcher.accept_file = accept_file
+
+                watcher.target_time_for_single_scan = poll_target_time
+                watcher.target_time_for_notification = poll_target_time
+                self._fsnotify_thread.start()
+        except:
+            pydev_log.exception('Error setting up auto-reload.')
 
     def get_arg_ppid(self):
         try:
@@ -1077,6 +1157,9 @@ class PyDB(object):
 
             return cache[cache_key]
 
+    def in_project_roots_filename_uncached(self, absolute_filename):
+        return self._files_filtering.in_project_roots(absolute_filename)
+
     def _clear_filters_caches(self):
         self._in_project_scope_cache.clear()
         self._exclude_by_filter_cache.clear()
@@ -1389,6 +1472,9 @@ class PyDB(object):
                 import_hook_manager.add_module_name(module, self.mpl_modules_for_patching.pop(module))
 
     def init_matplotlib_support(self):
+        if self._installed_mpl_support:
+            return
+        self._installed_mpl_support = True
         # prepare debugger for integration with matplotlib GUI event loop
         from pydev_ipython.matplotlibtools import activate_matplotlib, activate_pylab, activate_pyplot, do_enable_gui
 
@@ -1898,21 +1984,13 @@ class PyDB(object):
                 # When in a coroutine we switch to CMD_STEP_INTO_COROUTINE.
                 info.pydev_step_cmd = CMD_STEP_INTO_COROUTINE
                 info.pydev_step_stop = frame
-                info.pydev_smart_step_stop = None
                 self.set_trace_for_frame_and_parents(frame)
             else:
                 info.pydev_step_stop = None
-                info.pydev_smart_step_stop = None
                 self.set_trace_for_frame_and_parents(frame)
 
-        elif info.pydev_step_cmd in (CMD_STEP_OVER, CMD_STEP_OVER_MY_CODE):
+        elif info.pydev_step_cmd in (CMD_STEP_OVER, CMD_STEP_OVER_MY_CODE, CMD_SMART_STEP_INTO):
             info.pydev_step_stop = frame
-            info.pydev_smart_step_stop = None
-            self.set_trace_for_frame_and_parents(frame)
-
-        elif info.pydev_step_cmd == CMD_SMART_STEP_INTO:
-            info.pydev_step_stop = None
-            info.pydev_smart_step_stop = frame
             self.set_trace_for_frame_and_parents(frame)
 
         elif info.pydev_step_cmd == CMD_RUN_TO_LINE or info.pydev_step_cmd == CMD_SET_NEXT_STATEMENT:
@@ -2269,8 +2347,7 @@ class PyDB(object):
             if INTERACTIVE_MODE_AVAILABLE:
                 self.init_matplotlib_support()
         except:
-            sys.stderr.write("Matplotlib support in debugger failed\n")
-            pydev_log.exception()
+            pydev_log.exception("Matplotlib support in debugger failed")
 
         if hasattr(sys, 'exc_clear'):
             # we should clean exception information in Python 2, before user's code execution
@@ -2718,6 +2795,13 @@ def _locked_settrace(
 
         py_db.wait_for_ready_to_run()
         py_db.start_auxiliary_daemon_threads()
+        
+        try:
+            if INTERACTIVE_MODE_AVAILABLE:
+                py_db.init_matplotlib_support()
+        except:
+            pydev_log.exception("Matplotlib support in debugger failed")
+
         if trace_only_current_thread:
             py_db.enable_tracing()
         else:
