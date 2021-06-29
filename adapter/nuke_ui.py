@@ -149,6 +149,7 @@ class NukeUI(adapter.AdapterConfiguration):
 					"name": "Nuke: Custom UI Debugging",
 					"type": adapter_type,
 					"request": "attach",  # can only be attach or launch
+					"pythonPath": "",
 					"host": "localhost",
 					"port": 7005,
 				}
